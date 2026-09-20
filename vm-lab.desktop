@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=VM Lab
+Comment=One-click disposable VM launcher for libvirt
+Exec=vm-lab
+Icon=vm-lab
+Type=Application
+Categories=System;Utility;
+Terminal=false

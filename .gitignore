@@ -1,0 +1,12 @@
+
+icon.jpeg
+icon.png
+
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.AppImage
+linuxdeploy
+AppDir/

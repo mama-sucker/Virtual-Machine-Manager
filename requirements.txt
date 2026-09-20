@@ -1,0 +1,14 @@
+# VM Lab - Python dependencies
+# Made for Pop!_OS Linux with the COSMIC desktop environment
+#
+# Install with:
+#   pip3 install -r requirements.txt
+#
+# System dependencies (Pop!_OS / Ubuntu):
+#   sudo apt install python3-pyqt6 virt-viewer libvirt-clients qemu-utils
+# Optional (X11 fallback):
+#   sudo apt install wmctrl
+# COSMIC workspace support:
+#   cargo install cos-cli
+
+PyQt6>=6.6

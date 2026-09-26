@@ -10,3 +10,4 @@ dist/
 *.AppImage
 linuxdeploy
 AppDir/
+venv

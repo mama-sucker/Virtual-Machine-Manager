@@ -1,15 +1,26 @@
-# Python based QT application for easily controlling my virtual machines in libvirt 
-
 #!/usr/bin/env python3
 """
-Virtual Machine Manager - one-click disposable Kali / Windows 11 VMs on top of libvirt.
+Virtual Machine Manager - one-click disposable VMs on top of libvirt.
+
+Works on Plasma (X11 or Wayland), COSMIC, and other X11 desktops (via wmctrl).
+Everything machine-specific is configured through the in-app Settings dialog
+(gear button, or shown automatically the first time you run it) - no editing
+this file required:
+  * Where your VM disk images live (default folder when adding a VM, and
+    where disposable "live" overlays are kept).
+  * How many machines you have, what to call them, and which .qcow2 base
+    disk each one boots from.
+  * Which libvirt connection to use (defaults to qemu:///system).
 
 How it works
-  * kali_disk.qcow2 / windows11_disk.qcow2 are treated as read-only "golden" base images.
-  * The VMs actually boot from thin overlays (kali_live.qcow2 / windows11_live.qcow2)
-    that store only the changes. "Reset" = delete the overlay and recreate it.
-  * "Start" opens a new virtual desktop, switches to it, and launches virt-viewer fullscreen.
-    When you close the viewer, it switches back and removes that desktop.
+  * Each VM's chosen base disk (e.g. kali_disk.qcow2) is treated as a
+    read-only "golden" image.
+  * The VM actually boots from a thin overlay (<id>_live.qcow2, kept in your
+    configured image folder) that stores only the changes. "Reset" = delete
+    the overlay and recreate it.
+  * "Start" opens a new virtual desktop, switches to it, and launches
+    virt-viewer fullscreen. Closing the viewer switches back and removes
+    that desktop.
 
 Requirements:  sudo apt install python3-pyqt6 virt-viewer libvirt-clients qemu-utils
 Optional (X11 non-KDE fallback for workspaces): sudo apt install wmctrl
@@ -23,39 +34,67 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from PyQt6.QtCore import QProcess, Qt, QTimer
 from PyQt6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QInputDialog, QLabel,
-    QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFileDialog,
+    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
-# ----------------------------------------------------------------------------
-# Settings - tweak these if your setup differs
-# ----------------------------------------------------------------------------
-LIBVIRT_URI = "qemu:///system"          # use "qemu:///session" if your VMs live in the user session
-IMAGE_DIR = Path.home() / "virt-machines" / "images"
-CONFIG_FILE = Path.home() / ".config" / "virtual-machine-manager" / "config.json"
 WINDOW_TITLE = "Virtual Machine Manager"
+CONFIG_FILE = Path.home() / ".config" / "virtual-machine-manager" / "config.json"
+DEFAULT_LIBVIRT_URI = "qemu:///system"
 
-VMS = {
-    "kali": {
-        "label": "Kali Linux",
-        "base": IMAGE_DIR / "kali_disk.qcow2",
-        "overlay": IMAGE_DIR / "kali_live.qcow2",
-    },
-    "windows": {
-        "label": "Windows 11",
-        "base": IMAGE_DIR / "windows11_disk.qcow2",
-        "overlay": IMAGE_DIR / "windows11_live.qcow2",
-    },
-}
+LIBVIRT_URI = DEFAULT_LIBVIRT_URI   # set from config at startup; used by virsh()
 
 
 class Cancelled(Exception):
     pass
+
+
+# ----------------------------------------------------------------------------
+# Config - everything machine-specific lives here, not in this file
+# ----------------------------------------------------------------------------
+def default_config():
+    return {
+        "image_dir": str(Path.home() / "virt-machines" / "images"),
+        "libvirt_uri": DEFAULT_LIBVIRT_URI,
+        "vms": [],   # each: {"id", "label", "base", "domain"(optional, set after first link)}
+    }
+
+
+def load_config():
+    cfg = default_config()
+    try:
+        loaded = json.loads(CONFIG_FILE.read_text())
+        cfg.update({k: v for k, v in loaded.items() if k in cfg})
+        for vm in cfg.get("vms", []):
+            vm.setdefault("id", new_vm_id(cfg["vms"]))
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+
+def new_vm_id(existing_vms):
+    used = {vm.get("id") for vm in existing_vms}
+    while True:
+        vid = uuid.uuid4().hex[:8]
+        if vid not in used:
+            return vid
+
+
+def overlay_path(image_dir, vm):
+    return Path(image_dir) / f"{vm['id']}_live.qcow2"
 
 
 # ----------------------------------------------------------------------------
@@ -99,6 +138,7 @@ def find_domain(paths):
 
 
 def make_overlay(base, overlay):
+    overlay.parent.mkdir(parents=True, exist_ok=True)
     overlay.unlink(missing_ok=True)
     run([
         "qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
@@ -147,9 +187,11 @@ def point_disk_at_overlay(domain, base, overlay, running):
 
 
 # ----------------------------------------------------------------------------
-# Workspace (virtual desktop) backends
+# Workspace (virtual desktop) backends - unchanged. KDE's D-Bus interface
+# works identically on Plasma X11 and Wayland, so no session-type check is
+# needed for KDE specifically; only the plain-X11 fallback cares about it.
 # ----------------------------------------------------------------------------
-UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 class KDEWorkspaces:
@@ -164,10 +206,10 @@ class KDEWorkspaces:
         return run(self.BASE + ["org.freedesktop.DBus.Properties.Get", self.IFACE, prop])
 
     def desktops(self):
-        return UUID.findall(self._get("desktops"))
+        return UUID_RE.findall(self._get("desktops"))
 
     def current(self):
-        m = UUID.search(self._get("current"))
+        m = UUID_RE.search(self._get("current"))
         if not m:
             raise RuntimeError("couldn't read current desktop")
         return m.group(0)
@@ -335,7 +377,7 @@ def pick_workspaces():
         return None, "Workspaces off: cos-cli not found (cargo install --git https://github.com/estin/cos-cli)"
     if "KDE" in desktop.upper():
         if shutil.which("gdbus"):
-            return KDEWorkspaces(), "Workspaces: KDE Plasma"
+            return KDEWorkspaces(), f"Workspaces: KDE Plasma ({session})"
         return None, "Workspaces off: gdbus missing (sudo apt install libglib2.0-bin)"
     if session == "x11":
         if shutil.which("wmctrl"):
@@ -345,98 +387,261 @@ def pick_workspaces():
 
 
 # ----------------------------------------------------------------------------
-# Config (remembers which libvirt domain belongs to which machine)
-# ----------------------------------------------------------------------------
-def load_config():
-    try:
-        return json.loads(CONFIG_FILE.read_text())
-    except Exception:
-        return {}
-
-
-def save_config(cfg):
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-
-
-# ----------------------------------------------------------------------------
-# GUI
+# Styling
 # ----------------------------------------------------------------------------
 STYLE = """
 QWidget { background:#15171c; color:#e6e6e6; font-size:14px; }
 QLabel { background:transparent; }
+QDialog { background:#15171c; }
 QFrame#card { background:#1e2129; border:1px solid #2c3140; border-radius:12px; }
 QLabel#title { font-size:20px; font-weight:600; }
 QLabel#status { color:#8b93a7; }
+QLineEdit { background:#1e2129; border:1px solid #2c3140; border-radius:6px; padding:6px; color:#e6e6e6; }
+QTableWidget { background:#1e2129; border:1px solid #2c3140; border-radius:6px; gridline-color:#2c3140; }
+QHeaderView::section { background:#1e2129; color:#8b93a7; border:none; padding:6px; }
 QPushButton { background:#2c3140; border:none; border-radius:8px; padding:10px 14px; }
 QPushButton:hover { background:#384058; }
 QPushButton:disabled { color:#5c6478; background:#22262f; }
 QPushButton#primary { background:#a31a1a; color:white; font-weight:600; padding:14px; }
-QPushButton#primary:hover { background:#2f6fd8; }
+QPushButton#primary:hover { background:#c62828; }
 QPushButton#primary:disabled { background:#22262f; color:#5c6478; }
 QPushButton#danger { color:#ff9a9a; }
+QPushButton#gear { background:transparent; font-size:16px; padding:6px 10px; }
+QPushButton#gear:hover { background:#2c3140; }
 """
+
+
+# ----------------------------------------------------------------------------
+# Settings dialog - the only place machine-specific setup happens
+# ----------------------------------------------------------------------------
+class SettingsDialog(QDialog):
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{WINDOW_TITLE} - Settings")
+        self.resize(640, 420)
+        self.vms = [dict(vm) for vm in cfg["vms"]]     # work on a copy until Save
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel(
+            "VM disk folder (new base disks default here; disposable overlays are always kept here):"))
+        dir_row = QHBoxLayout()
+        self.dir_edit = QLineEdit(cfg["image_dir"])
+        dir_browse = QPushButton("Browse…")
+        dir_browse.clicked.connect(self.browse_dir)
+        dir_row.addWidget(self.dir_edit)
+        dir_row.addWidget(dir_browse)
+        layout.addLayout(dir_row)
+
+        layout.addWidget(QLabel("libvirt connection (leave as-is unless you know you need session mode):"))
+        self.uri_edit = QLineEdit(cfg.get("libvirt_uri", DEFAULT_LIBVIRT_URI))
+        layout.addWidget(self.uri_edit)
+
+        layout.addWidget(QLabel("Virtual machines:"))
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Display name", "Base disk (.qcow2)"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        for vm in self.vms:
+            self.add_row(vm)
+        layout.addWidget(self.table)
+
+        vm_buttons = QHBoxLayout()
+        add_btn = QPushButton("Add VM…")
+        add_btn.clicked.connect(self.add_vm)
+        remove_btn = QPushButton("Remove selected")
+        remove_btn.setObjectName("danger")
+        remove_btn.clicked.connect(self.remove_selected)
+        vm_buttons.addWidget(add_btn)
+        vm_buttons.addWidget(remove_btn)
+        vm_buttons.addStretch()
+        layout.addLayout(vm_buttons)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "VM disk folder", self.dir_edit.text())
+        if d:
+            self.dir_edit.setText(d)
+
+    def add_row(self, vm):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(vm["label"]))
+        path_btn = QPushButton(vm.get("base") or "(choose a disk…)")
+        path_btn.setToolTip(vm.get("base", ""))
+        path_btn.clicked.connect(lambda _=False, r=row: self.browse_base(r))
+        self.table.setCellWidget(row, 1, path_btn)
+        self.table.setRowHeight(row, 34)
+
+    def browse_base(self, row):
+        start = self.vms[row].get("base") or self.dir_edit.text()
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Base disk image", start, "Disk images (*.qcow2 *.img *.raw);;All files (*)")
+        if path:
+            self.vms[row]["base"] = path
+            btn = self.table.cellWidget(row, 1)
+            btn.setText(path)
+            btn.setToolTip(path)
+
+    def add_vm(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Base disk image", self.dir_edit.text(), "Disk images (*.qcow2 *.img *.raw);;All files (*)")
+        if not path:
+            return
+        default_label = Path(path).stem.replace("_", " ").title()
+        label, ok = QInputDialog.getText(self, "Add VM", "Display name:", text=default_label)
+        if not ok or not label.strip():
+            return
+        vm = {"id": new_vm_id(self.vms), "label": label.strip(), "base": path}
+        self.vms.append(vm)
+        self.add_row(vm)
+
+    def remove_selected(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        names = ", ".join(self.vms[r]["label"] for r in rows)
+        if QMessageBox.question(
+            self, "Remove VM", f"Remove {names} from the list?\n\nDisk files on disk are not deleted."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        for r in rows:
+            self.table.removeRow(r)
+            del self.vms[r]
+
+    def on_accept(self):
+        if not self.dir_edit.text().strip():
+            QMessageBox.warning(self, "Settings", "Please choose a VM disk folder.")
+            return
+        for row in range(self.table.rowCount()):
+            self.vms[row]["label"] = self.table.item(row, 0).text().strip() or self.vms[row]["label"]
+        missing = [vm["label"] for vm in self.vms if not vm.get("base")]
+        if missing:
+            QMessageBox.warning(self, "Settings", "Choose a base disk for: " + ", ".join(missing))
+            return
+        self.accept()
+
+    def result_config(self, cfg):
+        cfg["image_dir"] = self.dir_edit.text().strip()
+        cfg["libvirt_uri"] = self.uri_edit.text().strip() or DEFAULT_LIBVIRT_URI
+        cfg["vms"] = self.vms
+        return cfg
 
 
 class Card:
     pass
 
 
+# ----------------------------------------------------------------------------
+# Main window
+# ----------------------------------------------------------------------------
 class Launcher(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE)
         self.setStyleSheet(STYLE)
-        self.config = load_config()
+        self.cfg = load_config()
+        self._apply_libvirt_uri()
         self.ws, ws_note = pick_workspaces()
-        self.sessions = {}     # key -> {"proc", "origin", "new"}
+        self.sessions = {}     # vm id -> {"proc", "origin", "new"}
         self.cards = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(20, 20, 20, 12)
-        row = QHBoxLayout()
-        row.setSpacing(16)
-        for key, vm in VMS.items():
-            row.addWidget(self._build_card(key, vm))
-        outer.addLayout(row)
+
+        header = QHBoxLayout()
+        header.addStretch()
+        gear = QPushButton("⚙ Settings")
+        gear.setObjectName("gear")
+        gear.clicked.connect(self.open_settings)
+        header.addWidget(gear)
+        outer.addLayout(header)
+
+        self.grid_holder = QWidget()
+        self.grid = QGridLayout(self.grid_holder)
+        self.grid.setSpacing(16)
+        outer.addWidget(self.grid_holder)
+
+        self.empty_label = QLabel("No virtual machines configured yet - click Settings to add one.")
+        self.empty_label.setObjectName("status")
+        outer.addWidget(self.empty_label)
+
         self.note = QLabel(ws_note)
         self.note.setObjectName("status")
         outer.addWidget(self.note)
-        self.resize(560, 270)
 
-        for key in VMS:                       # try to auto-link domains to machines
-            try:
-                self.domain_for(key)
-            except Exception:
-                pass
-        self.refresh()
+        self.rebuild_cards()
+        self.resize(640, 300)
+
         timer = QTimer(self)
         timer.timeout.connect(self.refresh)
         timer.start(2000)
+        self._timer = timer  # keep a reference
+
+        if not self.cfg["vms"]:
+            QTimer.singleShot(0, self.open_settings)
+
+    def _apply_libvirt_uri(self):
+        global LIBVIRT_URI
+        LIBVIRT_URI = self.cfg.get("libvirt_uri", DEFAULT_LIBVIRT_URI)
+
+    # ---- settings ----------------------------------------------------
+    def open_settings(self):
+        dlg = SettingsDialog(self.cfg, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.cfg = dlg.result_config(self.cfg)
+            save_config(self.cfg)
+            self._apply_libvirt_uri()
+            self.rebuild_cards()
 
     # ---- UI construction -------------------------------------------------
-    def _build_card(self, key, vm):
+    def rebuild_cards(self):
+        for i in reversed(range(self.grid.count())):
+            w = self.grid.itemAt(i).widget()
+            if w:
+                w.setParent(None)
+        self.cards = {}
+        vms = self.cfg["vms"]
+        self.empty_label.setVisible(not vms)
+        self.grid_holder.setVisible(bool(vms))
+        for idx, vm in enumerate(vms):
+            row, col = divmod(idx, 3)
+            self.grid.addWidget(self._build_card(vm), row, col)
+        self.refresh()
+
+    def _build_card(self, vm):
+        vid = vm["id"]
         c = Card()
+        c.vm_id = vid
         frame = QFrame()
         frame.setObjectName("card")
+        frame.setMinimumWidth(190)
         col = QVBoxLayout(frame)
         col.setContentsMargins(18, 18, 18, 18)
         col.setSpacing(10)
 
         title = QLabel(vm["label"])
         title.setObjectName("title")
+        title.setWordWrap(True)
         c.status = QLabel("...")
         c.status.setObjectName("status")
+        c.status.setWordWrap(True)
         c.start = QPushButton("Start")
         c.start.setObjectName("primary")
-        c.start.clicked.connect(lambda _=False, k=key: self.launch(k))
+        c.start.clicked.connect(lambda _=False, v=vid: self.launch(v))
 
         small = QHBoxLayout()
         c.stop = QPushButton("Shut down")
-        c.stop.clicked.connect(lambda _=False, k=key: self.shutdown(k))
+        c.stop.clicked.connect(lambda _=False, v=vid: self.shutdown(v))
         c.reset = QPushButton("Reset")
         c.reset.setObjectName("danger")
-        c.reset.clicked.connect(lambda _=False, k=key: self.reset(k))
+        c.reset.clicked.connect(lambda _=False, v=vid: self.reset(v))
         small.addWidget(c.stop)
         small.addWidget(c.reset)
 
@@ -445,18 +650,25 @@ class Launcher(QWidget):
         col.addStretch()
         col.addWidget(c.start)
         col.addLayout(small)
-        self.cards[key] = c
+        self.cards[vid] = c
         return frame
 
     def error(self, text):
-        QMessageBox.critical(self, "Virtual Machine Manager", text)
+        QMessageBox.critical(self, WINDOW_TITLE, text)
+
+    def vm_by_id(self, vid):
+        for vm in self.cfg["vms"]:
+            if vm["id"] == vid:
+                return vm
+        return None
 
     # ---- domain / state --------------------------------------------------
-    def domain_for(self, key, interactive=False):
-        if key in self.config:
-            return self.config[key]
-        vm = VMS[key]
-        name = find_domain([vm["base"], vm["overlay"]])
+    def domain_for(self, vm, interactive=False):
+        if vm.get("domain"):
+            return vm["domain"]
+        base = Path(vm["base"])
+        overlay = overlay_path(self.cfg["image_dir"], vm)
+        name = find_domain([base, overlay])
         if not name and interactive:
             names = all_domains()
             if not names:
@@ -469,41 +681,47 @@ class Launcher(QWidget):
             answer = QMessageBox.question(
                 self, "Link VM",
                 f"Use '{name}' as {vm['label']}?\n\nIts main disk will be switched to a disposable "
-                f"overlay on top of:\n{vm['base']}",
+                f"overlay on top of:\n{base}",
             )
             if answer != QMessageBox.StandardButton.Yes:
                 raise Cancelled()
         if name:
-            self.config[key] = name
-            save_config(self.config)
+            vm["domain"] = name
+            save_config(self.cfg)
         return name
 
     def domstate(self, domain):
         return virsh("domstate", domain, check=False).strip()
 
     def refresh(self):
-        for key, c in self.cards.items():
-            domain = self.config.get(key)
+        for vid, c in self.cards.items():
+            vm = self.vm_by_id(vid)
+            if vm is None:
+                continue
+            domain = vm.get("domain")
             state = self.domstate(domain) if domain else ""
             if not domain:
                 text = "Ready - will link on first start"
+            elif not Path(vm["base"]).exists():
+                text = "Base disk not found - check Settings"
             else:
                 text = {"running": "Running", "shut off": "Stopped", "paused": "Paused"}.get(
                     state, state or "Unknown")
-            if key in self.sessions:
+            if vid in self.sessions:
                 text += "  -  viewing"
             c.status.setText(text)
             c.start.setText("Open" if state in ("running", "paused") else "Start")
-            c.start.setEnabled(key not in self.sessions)
+            c.start.setEnabled(vid not in self.sessions)
             c.stop.setEnabled(state == "running")
 
     # ---- preparing the overlay ------------------------------------------
-    def prepare(self, key, recreate=False):
-        vm = VMS[key]
-        base, overlay = vm["base"], vm["overlay"]
+    def prepare(self, vid, recreate=False):
+        vm = self.vm_by_id(vid)
+        base = Path(vm["base"])
+        overlay = overlay_path(self.cfg["image_dir"], vm)
         if not base.exists():
-            raise RuntimeError(f"Base image not found:\n{base}")
-        domain = self.domain_for(key, interactive=True)
+            raise RuntimeError(f"Base disk not found:\n{base}\n\nFix its location in Settings.")
+        domain = self.domain_for(vm, interactive=True)
         if not domain:
             raise RuntimeError(
                 f"No libvirt VM uses {base.name}. Is the VM defined in virt-manager?")
@@ -522,12 +740,12 @@ class Launcher(QWidget):
         return domain
 
     # ---- actions ---------------------------------------------------------
-    def launch(self, key):
-        if key in self.sessions:
+    def launch(self, vid):
+        if vid in self.sessions:
             return
         self.setCursor(Qt.CursorShape.WaitCursor)
         try:
-            domain = self.prepare(key)
+            domain = self.prepare(vid)
             state = self.domstate(domain)
             if state == "paused":
                 virsh("resume", domain)
@@ -541,39 +759,40 @@ class Launcher(QWidget):
         finally:
             self.unsetCursor()
 
+        vm = self.vm_by_id(vid)
         session = {"proc": None, "origin": None, "new": None}
-        self.sessions[key] = session
+        self.sessions[vid] = session
         if self.ws:
             try:
                 session["origin"] = self.ws.current()
-                session["new"] = self.ws.create(f"Virtual Machine Manager: {VMS[key]['label']}")
+                session["new"] = self.ws.create(f"{WINDOW_TITLE}: {vm['label']}")
                 self.ws.switch(session["new"])
             except Exception as e:
                 self.note.setText(f"Workspace switch failed: {e}")
                 print(f"[vm-lab] workspace switch failed: {e}", file=sys.stderr)
         self.refresh()
-        QTimer.singleShot(500, lambda: self.spawn_viewer(key, domain))
+        QTimer.singleShot(500, lambda: self.spawn_viewer(vid, domain))
 
-    def spawn_viewer(self, key, domain):
-        session = self.sessions.get(key)
+    def spawn_viewer(self, vid, domain):
+        session = self.sessions.get(vid)
         if session is None:
             return
         proc = QProcess(self)
-        proc.finished.connect(lambda *_: self.viewer_closed(key))
-        proc.errorOccurred.connect(lambda *_: self.viewer_closed(key))
+        proc.finished.connect(lambda *_: self.viewer_closed(vid))
+        proc.errorOccurred.connect(lambda *_: self.viewer_closed(vid))
         session["proc"] = proc
         proc.start("virt-viewer", ["-c", LIBVIRT_URI, "--full-screen", domain])
 
         if session["new"] is not None and hasattr(self.ws, "place_window"):
             session["tries"] = 0
             timer = QTimer(self)
-            timer.timeout.connect(lambda: self.place_viewer(key, domain))
+            timer.timeout.connect(lambda: self.place_viewer(vid, domain))
             session["timer"] = timer
             timer.start(400)
 
-    def place_viewer(self, key, domain):
+    def place_viewer(self, vid, domain):
         """COSMIC: once the viewer window exists, pin it to the new workspace."""
-        session = self.sessions.get(key)
+        session = self.sessions.get(vid)
         if not session:
             return
         session["tries"] += 1
@@ -590,8 +809,8 @@ class Launcher(QWidget):
             session["timer"].stop()
             self.note.setText("Viewer window never appeared in cos-cli info")
 
-    def viewer_closed(self, key):
-        session = self.sessions.pop(key, None)
+    def viewer_closed(self, vid):
+        session = self.sessions.pop(vid, None)
         if not session:
             return
         if session.get("timer"):
@@ -607,14 +826,16 @@ class Launcher(QWidget):
         self.activateWindow()
         self.refresh()
 
-    def shutdown(self, key):
-        domain = self.config.get(key)
+    def shutdown(self, vid):
+        vm = self.vm_by_id(vid)
+        domain = vm.get("domain") if vm else None
         if domain:
             virsh("shutdown", domain, check=False)
         self.refresh()
 
-    def reset(self, key):
-        label = VMS[key]["label"]
+    def reset(self, vid):
+        vm = self.vm_by_id(vid)
+        label = vm["label"]
         answer = QMessageBox.question(
             self, "Reset",
             f"Reset {label} to its original install?\n\n"
@@ -622,12 +843,12 @@ class Launcher(QWidget):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        session = self.sessions.get(key)
+        session = self.sessions.get(vid)
         if session and session["proc"]:
             session["proc"].terminate()
         self.setCursor(Qt.CursorShape.WaitCursor)
         try:
-            self.prepare(key, recreate=True)
+            self.prepare(vid, recreate=True)
         except Cancelled:
             return
         except Exception as e:
@@ -650,7 +871,7 @@ def main():
     missing = [t for t in ("virsh", "virt-viewer", "qemu-img") if not shutil.which(t)]
     if missing:
         QMessageBox.critical(
-            None, "Virtual Machine Manager",
+            None, WINDOW_TITLE,
             "Missing tools: " + ", ".join(missing) +
             "\n\nInstall with:\nsudo apt install virt-viewer libvirt-clients qemu-utils",
         )

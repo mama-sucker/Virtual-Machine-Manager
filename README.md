@@ -1,5 +1,10 @@
 # VM Lab
 
+Still need to update the README for v2.0 
+lots of changes added for Plasma X11 support and more app configuration
+
+
+
 > **Made for Pop!_OS Linux with the COSMIC desktop environment**
 
 A PyQt6 desktop application for launching disposable virtual machines on top of **libvirt** with a single click.
